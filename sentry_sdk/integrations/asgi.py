@@ -4,13 +4,14 @@ An ASGI middleware.
 Based on Tom Christie's `sentry-asgi <https://github.com/encode/sentry-asgi>`_.
 """
 
+import asyncio
 import functools
+import inspect
 import urllib
 
 from sentry_sdk._types import MYPY
 from sentry_sdk.hub import Hub, _should_send_default_pii
 from sentry_sdk.integrations._wsgi_common import _filter_headers
-from sentry_sdk.serializer import partial_serialize
 from sentry_sdk.utils import ContextVar, event_from_exception, transaction_from_function
 from sentry_sdk.tracing import Span
 
@@ -18,6 +19,7 @@ if MYPY:
     from typing import Dict
     from typing import Any
     from typing import Optional
+    from typing import Callable
 
     from sentry_sdk._types import Event, Hint
 
@@ -38,26 +40,45 @@ def _capture_exception(hub, exc):
         hub.capture_event(event, hint=hint)
 
 
+def _looks_like_asgi3(app):
+    # type: (Any) -> bool
+    """
+    Try to figure out if an application object supports ASGI3.
+
+    This is how uvicorn figures out the application version as well.
+    """
+    if inspect.isclass(app):
+        return hasattr(app, "__await__")
+    elif inspect.isfunction(app):
+        return asyncio.iscoroutinefunction(app)
+    else:
+        call = getattr(app, "__call__", None)  # noqa
+        return asyncio.iscoroutinefunction(call)
+
+
 class SentryAsgiMiddleware:
-    __slots__ = ("app",)
+    __slots__ = ("app", "__call__")
 
     def __init__(self, app):
         # type: (Any) -> None
         self.app = app
 
-    def __call__(self, scope, receive=None, send=None):
-        # type: (Any, Any, Any) -> Any
-        if receive is None or send is None:
-
-            async def run_asgi2(receive, send):
-                # type: (Any, Any) -> Any
-                return await self._run_app(
-                    scope, lambda: self.app(scope)(receive, send)
-                )
-
-            return run_asgi2
+        if _looks_like_asgi3(app):
+            self.__call__ = self._run_asgi3  # type: Callable[..., Any]
         else:
-            return self._run_app(scope, lambda: self.app(scope, receive, send))
+            self.__call__ = self._run_asgi2
+
+    def _run_asgi2(self, scope):
+        # type: (Any) -> Any
+        async def inner(receive, send):
+            # type: (Any, Any) -> Any
+            return await self._run_app(scope, lambda: self.app(scope)(receive, send))
+
+        return inner
+
+    async def _run_asgi3(self, scope, receive, send):
+        # type: (Any, Any, Any) -> Any
+        return await self._run_app(scope, lambda: self.app(scope, receive, send))
 
     async def _run_app(self, scope, callback):
         # type: (Any, Any) -> Any
@@ -87,6 +108,9 @@ class SentryAsgiMiddleware:
                 span.transaction = "generic ASGI request"
 
                 with hub.start_span(span) as span:
+                    # XXX: Would be cool to have correct span status, but we
+                    # would have to wrap send(). That is a bit hard to do with
+                    # the current abstraction over ASGI 2/3.
                     try:
                         return await callback()
                     except Exception as exc:
@@ -114,9 +138,7 @@ class SentryAsgiMiddleware:
             # an endpoint, overwrite our path-based transaction name.
             event["transaction"] = self.get_transaction(asgi_scope)
 
-        event["request"] = partial_serialize(
-            Hub.current.client, request_info, should_repr_strings=False
-        )
+        event["request"] = request_info
 
         return event
 

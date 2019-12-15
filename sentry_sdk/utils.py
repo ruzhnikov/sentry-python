@@ -348,32 +348,42 @@ def safe_str(value):
         return safe_repr(value)
 
 
-def safe_repr(value):
-    # type: (Any) -> str
-    try:
-        rv = repr(value)
-        if isinstance(rv, bytes):
-            rv = rv.decode("utf-8", "replace")
+if PY2:
 
-        # At this point `rv` contains a bunch of literal escape codes, like
-        # this (exaggerated example):
-        #
-        # u"\\x2f"
-        #
-        # But we want to show this string as:
-        #
-        # u"/"
+    def safe_repr(value):
+        # type: (Any) -> str
         try:
-            # unicode-escape does this job, but can only decode latin1. So we
-            # attempt to encode in latin1.
-            return rv.encode("latin1").decode("unicode-escape")
+            rv = repr(value).decode("utf-8", "replace")
+
+            # At this point `rv` contains a bunch of literal escape codes, like
+            # this (exaggerated example):
+            #
+            # u"\\x2f"
+            #
+            # But we want to show this string as:
+            #
+            # u"/"
+            try:
+                # unicode-escape does this job, but can only decode latin1. So we
+                # attempt to encode in latin1.
+                return rv.encode("latin1").decode("unicode-escape")
+            except Exception:
+                # Since usually strings aren't latin1 this can break. In those
+                # cases we just give up.
+                return rv
         except Exception:
-            # Since usually strings aren't latin1 this can break. In those
-            # cases we just give up.
-            return rv
-    except Exception:
-        # If e.g. the call to `repr` already fails
-        return u"<broken repr>"
+            # If e.g. the call to `repr` already fails
+            return u"<broken repr>"
+
+
+else:
+
+    def safe_repr(value):
+        # type: (Any) -> str
+        try:
+            return repr(value)
+        except Exception:
+            return "<broken repr>"
 
 
 def filename_for_module(module, abs_path):
@@ -427,9 +437,8 @@ def serialize_frame(frame, tb_lineno=None, with_locals=True):
         "post_context": post_context,
     }  # type: Dict[str, Any]
     if with_locals:
-        rv["vars"] = sentry_sdk.serializer.partial_serialize(
-            sentry_sdk.Hub.current.client, frame.f_locals
-        )
+        rv["vars"] = frame.f_locals
+
     return rv
 
 
@@ -739,11 +748,20 @@ def _get_contextvars():
     https://github.com/gevent/gevent/issues/1407
     """
     if not _is_threading_local_monkey_patched():
+        # aiocontextvars is a PyPI package that ensures that the contextvars
+        # backport (also a PyPI package) works with asyncio under Python 3.6
+        #
+        # Import it if available.
+        if not PY2 and sys.version_info < (3, 7):
+            try:
+                from aiocontextvars import ContextVar  # noqa
+
+                return True, ContextVar
+            except ImportError:
+                pass
+
         try:
             from contextvars import ContextVar
-
-            if not PY2 and sys.version_info < (3, 7):
-                import aiocontextvars  # noqa
 
             return True, ContextVar
         except ImportError:

@@ -6,7 +6,6 @@ from datetime import datetime
 
 import sentry_sdk
 
-from sentry_sdk.serializer import partial_serialize
 from sentry_sdk.utils import capture_internal_exceptions, logger, to_string
 from sentry_sdk._compat import PY2
 from sentry_sdk._types import MYPY
@@ -134,7 +133,7 @@ class Span(object):
         self.hub = hub
         self._tags = {}  # type: Dict[str, str]
         self._data = {}  # type: Dict[str, Any]
-        self.start_timestamp = datetime.now()
+        self.start_timestamp = datetime.utcnow()
 
         #: End timestamp of span
         self.timestamp = None  # type: Optional[datetime]
@@ -174,7 +173,7 @@ class Span(object):
     def __exit__(self, ty, value, tb):
         # type: (Optional[Any], Optional[Any], Optional[Any]) -> None
         if value is not None:
-            self.set_failure()
+            self._tags.setdefault("status", "internal_error")
 
         hub, scope, old_span = self._context_manager_state
         del self._context_manager_state
@@ -206,7 +205,8 @@ class Span(object):
         parent = cls.from_traceparent(headers.get("sentry-trace"))
         if parent is None:
             return cls()
-        return parent.new_span(same_process_as_parent=False)
+        parent.same_process_as_parent = False
+        return parent
 
     def iter_headers(self):
         # type: () -> Generator[Tuple[str, str], None, None]
@@ -237,7 +237,7 @@ class Span(object):
         else:
             sampled = None
 
-        return cls(trace_id=trace_id, span_id=span_id, sampled=sampled)
+        return cls(trace_id=trace_id, parent_span_id=span_id, sampled=sampled)
 
     def to_traceparent(self):
         # type: () -> str
@@ -254,27 +254,52 @@ class Span(object):
 
     def set_tag(self, key, value):
         # type: (str, Any) -> None
-        self._tags[key] = partial_serialize(
-            sentry_sdk.Hub.current.client, value, should_repr_strings=False
-        )
+        self._tags[key] = value
 
     def set_data(self, key, value):
         # type: (str, Any) -> None
-        self._data[key] = partial_serialize(
-            sentry_sdk.Hub.current.client, value, should_repr_strings=False
-        )
+        self._data[key] = value
 
-    def set_failure(self):
-        # type: () -> None
-        self.set_tag("status", "failure")
+    def set_status(self, value):
+        # type: (str) -> None
+        self.set_tag("status", value)
 
-    def set_success(self):
-        # type: () -> None
-        self.set_tag("status", "success")
+    def set_http_status(self, http_status):
+        # type: (int) -> None
+        self.set_tag("http.status_code", http_status)
+
+        if http_status < 400:
+            self.set_status("ok")
+        elif 400 <= http_status < 500:
+            if http_status == 403:
+                self.set_status("permission_denied")
+            elif http_status == 404:
+                self.set_status("not_found")
+            elif http_status == 429:
+                self.set_status("resource_exhausted")
+            elif http_status == 413:
+                self.set_status("failed_precondition")
+            elif http_status == 401:
+                self.set_status("unauthenticated")
+            elif http_status == 409:
+                self.set_status("already_exists")
+            else:
+                self.set_status("invalid_argument")
+        elif 500 <= http_status < 600:
+            if http_status == 504:
+                self.set_status("deadline_exceeded")
+            elif http_status == 501:
+                self.set_status("unimplemented")
+            elif http_status == 503:
+                self.set_status("unavailable")
+            else:
+                self.set_status("internal_error")
+        else:
+            self.set_status("unknown_error")
 
     def is_success(self):
         # type: () -> bool
-        return self._tags.get("status") in (None, "success")
+        return self._tags.get("status") == "ok"
 
     def finish(self, hub=None):
         # type: (Optional[sentry_sdk.Hub]) -> Optional[str]
@@ -284,7 +309,7 @@ class Span(object):
             # This transaction is already finished, so we should not flush it again.
             return None
 
-        self.timestamp = datetime.now()
+        self.timestamp = datetime.utcnow()
 
         _maybe_create_breadcrumbs_from_span(hub, self)
 
@@ -320,15 +345,9 @@ class Span(object):
                 "type": "transaction",
                 "transaction": self.transaction,
                 "contexts": {"trace": self.get_trace_context()},
-                "timestamp": partial_serialize(
-                    client, self.timestamp, is_databag=False, should_repr_strings=False
-                ),
-                "start_timestamp": partial_serialize(
-                    client,
-                    self.start_timestamp,
-                    is_databag=False,
-                    should_repr_strings=False,
-                ),
+                "tags": self._tags,
+                "timestamp": self.timestamp,
+                "start_timestamp": self.start_timestamp,
                 "spans": [
                     s.to_json(client)
                     for s in self._span_recorder.finished_spans
@@ -346,15 +365,8 @@ class Span(object):
             "same_process_as_parent": self.same_process_as_parent,
             "op": self.op,
             "description": self.description,
-            "start_timestamp": partial_serialize(
-                client,
-                self.start_timestamp,
-                is_databag=False,
-                should_repr_strings=False,
-            ),
-            "timestamp": partial_serialize(
-                client, self.timestamp, is_databag=False, should_repr_strings=False
-            ),
+            "start_timestamp": self.start_timestamp,
+            "timestamp": self.timestamp,
         }  # type: Dict[str, Any]
 
         transaction = self.transaction
@@ -433,7 +445,11 @@ def record_sql_queries(
 
     query = _format_sql(cursor, query)
 
-    data = {"db.params": params_list, "db.paramstyle": paramstyle}
+    data = {}
+    if params_list is not None:
+        data["db.params"] = params_list
+    if paramstyle is not None:
+        data["db.paramstyle"] = paramstyle
     if executemany:
         data["db.executemany"] = True
 
@@ -446,29 +462,13 @@ def record_sql_queries(
         yield span
 
 
-@contextlib.contextmanager
-def record_http_request(hub, url, method):
-    # type: (sentry_sdk.Hub, str, str) -> Generator[Dict[str, str], None, None]
-    data_dict = {"url": url, "method": method}
-
-    with hub.start_span(op="http", description="%s %s" % (method, url)) as span:
-        try:
-            yield data_dict
-        finally:
-            if span is not None:
-                if "status_code" in data_dict:
-                    span.set_tag("http.status_code", data_dict["status_code"])
-                for k, v in data_dict.items():
-                    span.set_data(k, v)
-
-
 def _maybe_create_breadcrumbs_from_span(hub, span):
     # type: (sentry_sdk.Hub, Span) -> None
     if span.op == "redis":
         hub.add_breadcrumb(
             message=span.description, type="redis", category="redis", data=span._tags
         )
-    elif span.op == "http" and span.is_success():
+    elif span.op == "http":
         hub.add_breadcrumb(type="http", category="httplib", data=span._data)
     elif span.op == "subprocess":
         hub.add_breadcrumb(

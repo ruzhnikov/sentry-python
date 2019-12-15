@@ -17,8 +17,6 @@ from sentry_sdk._types import MYPY
 if MYPY:
     from types import TracebackType
 
-    import sentry_sdk
-
     from typing import Any
     from typing import Dict
     from typing import List
@@ -38,10 +36,16 @@ if PY2:
     # Importing ABCs from collections is deprecated, and will stop working in 3.8
     # https://github.com/python/cpython/blob/master/Lib/collections/__init__.py#L49
     from collections import Mapping, Sequence
+
+    serializable_str_types = string_types
+
 else:
     # New in 3.3
     # https://docs.python.org/3/library/collections.abc.html
     from collections.abc import Mapping, Sequence
+
+    # Bytes are technically not strings in Python 3, but we can serialize them
+    serializable_str_types = (str, bytes)
 
 MAX_DATABAG_DEPTH = 5
 MAX_DATABAG_BREADTH = 10
@@ -262,7 +266,7 @@ def serialize(event, **kwargs):
             # might mutate our dictionary while we're still iterating over it.
             obj = dict(iteritems(obj))
 
-            rv_dict = {}
+            rv_dict = {}  # type: Dict[str, Any]
             i = 0
 
             for k, v in iteritems(obj):
@@ -281,13 +285,12 @@ def serialize(event, **kwargs):
                     else None,
                     remaining_breadth=remaining_breadth,
                 )
-                if v is not None:
-                    rv_dict[str_k] = v
-                    i += 1
+                rv_dict[str_k] = v
+                i += 1
 
             return rv_dict
 
-        elif not isinstance(obj, string_types) and isinstance(obj, Sequence):
+        elif not isinstance(obj, serializable_str_types) and isinstance(obj, Sequence):
             rv_list = []
 
             for i, v in enumerate(obj):
@@ -330,24 +333,3 @@ def serialize(event, **kwargs):
         return rv
     finally:
         disable_capture_event.set(False)
-
-
-def partial_serialize(client, data, should_repr_strings=True, is_databag=True):
-    # type: (Optional[sentry_sdk.Client], Any, bool, bool) -> Any
-    is_recursive = disable_capture_event.get(None)
-    if is_recursive:
-        return CYCLE_MARKER
-
-    if client is not None and client.options["_experiments"].get(
-        "fast_serialize", False
-    ):
-        data = serialize(
-            data, should_repr_strings=should_repr_strings, is_databag=is_databag
-        )
-
-        if isinstance(data, dict):
-            # TODO: Bring back _meta annotations
-            data.pop("_meta", None)
-        return data
-
-    return data

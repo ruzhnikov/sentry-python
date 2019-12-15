@@ -25,7 +25,7 @@ def test_basic(sentry_init, capture_events, sample_rate):
 
         span1, span2 = event["spans"]
         parent_span = event
-        assert span1["tags"]["status"] == "failure"
+        assert span1["tags"]["status"] == "internal_error"
         assert span1["op"] == "foo"
         assert span1["description"] == "foodesc"
         assert "status" not in span2.get("tags", {})
@@ -59,6 +59,9 @@ def test_continue_from_headers(sentry_init, capture_events, sampled):
     assert span is not None
     assert span.sampled == sampled
     assert span.trace_id == old_span.trace_id
+    assert span.same_process_as_parent is False
+    assert span.parent_span_id == old_span.span_id
+    assert span.span_id != old_span.span_id
 
     with Hub.current.start_span(span):
         with Hub.current.configure_scope() as scope:
@@ -102,9 +105,7 @@ def test_sampling_decided_only_for_transactions(sentry_init, capture_events):
     "args,expected_refcount",
     [({"traces_sample_rate": 1.0}, 100), ({"traces_sample_rate": 0.0}, 0)],
 )
-def test_memory_usage(
-    sentry_init, capture_events, args, expected_refcount, fast_serialize
-):
+def test_memory_usage(sentry_init, capture_events, args, expected_refcount):
     sentry_init(**args)
 
     references = weakref.WeakSet()
@@ -128,10 +129,7 @@ def test_memory_usage(
         # required only for pypy (cpython frees immediately)
         gc.collect()
 
-        if fast_serialize:
-            assert len(references) <= expected_refcount
-        else:
-            assert len(references) == expected_refcount
+        assert len(references) == expected_refcount
 
 
 def test_span_trimming(sentry_init, capture_events):

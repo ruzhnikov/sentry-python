@@ -11,7 +11,6 @@ from celery.exceptions import (  # type: ignore
 )
 
 from sentry_sdk.hub import Hub
-from sentry_sdk.serializer import partial_serialize
 from sentry_sdk.utils import capture_internal_exceptions, event_from_exception
 from sentry_sdk.tracing import Span
 from sentry_sdk._compat import reraise
@@ -73,6 +72,10 @@ class CeleryIntegration(Integration):
         ignore_logger("celery.worker.job")
         ignore_logger("celery.app.trace")
 
+        # This is stdout/err redirected to a logger, can't deal with this
+        # (need event_level=logging.WARN to reproduce)
+        ignore_logger("celery.redirected")
+
 
 def _wrap_apply_async(task, f):
     # type: (Any, F) -> F
@@ -123,6 +126,9 @@ def _wrap_tracer(task, f):
             span.op = "celery.task"
             span.transaction = "unknown celery task"
 
+            # Could possibly use a better hook than this one
+            span.set_status("ok")
+
             with capture_internal_exceptions():
                 # Celery task objects are not a thing to be trusted. Even
                 # something such as attribute access can fail.
@@ -161,15 +167,14 @@ def _make_event_processor(task, uuid, args, kwargs, request=None):
     # type: (Any, Any, Any, Any, Optional[Any]) -> EventProcessor
     def event_processor(event, hint):
         # type: (Event, Hint) -> Optional[Event]
-        client = Hub.current.client
 
         with capture_internal_exceptions():
             extra = event.setdefault("extra", {})
-            extra["celery-job"] = partial_serialize(
-                client,
-                {"task_name": task.name, "args": args, "kwargs": kwargs},
-                should_repr_strings=False,
-            )
+            extra["celery-job"] = {
+                "task_name": task.name,
+                "args": args,
+                "kwargs": kwargs,
+            }
 
         if "exc_info" in hint:
             with capture_internal_exceptions():
@@ -177,11 +182,7 @@ def _make_event_processor(task, uuid, args, kwargs, request=None):
                     event["fingerprint"] = [
                         "celery",
                         "SoftTimeLimitExceeded",
-                        partial_serialize(
-                            client,
-                            getattr(task, "name", task),
-                            should_repr_strings=False,
-                        ),
+                        getattr(task, "name", task),
                     ]
 
         return event
@@ -196,7 +197,12 @@ def _capture_exception(task, exc_info):
     if hub.get_integration(CeleryIntegration) is None:
         return
     if isinstance(exc_info[1], CELERY_CONTROL_FLOW_EXCEPTIONS):
+        # ??? Doesn't map to anything
+        _set_status(hub, "aborted")
         return
+
+    _set_status(hub, "internal_error")
+
     if hasattr(task, "throws") and isinstance(exc_info[1], task.throws):
         return
 
@@ -211,10 +217,13 @@ def _capture_exception(task, exc_info):
 
     hub.capture_event(event, hint=hint)
 
+
+def _set_status(hub, status):
+    # type: (Hub, str) -> None
     with capture_internal_exceptions():
         with hub.configure_scope() as scope:
             if scope.span is not None:
-                scope.span.set_failure()
+                scope.span.set_status(status)
 
 
 def _patch_worker_exit():

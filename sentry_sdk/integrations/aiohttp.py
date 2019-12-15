@@ -9,7 +9,7 @@ from sentry_sdk.integrations._wsgi_common import (
     _filter_headers,
     request_body_within_bounds,
 )
-from sentry_sdk.serializer import partial_serialize
+from sentry_sdk.tracing import Span
 from sentry_sdk.utils import (
     capture_internal_exceptions,
     event_from_exception,
@@ -70,16 +70,27 @@ class AioHttpIntegration(Integration):
                         scope.clear_breadcrumbs()
                         scope.add_event_processor(_make_request_processor(weak_request))
 
+                    span = Span.continue_from_headers(request.headers)
+                    span.op = "http.server"
                     # If this transaction name makes it to the UI, AIOHTTP's
                     # URL resolver did not find a route or died trying.
-                    with hub.start_span(transaction="generic AIOHTTP request"):
+                    span.transaction = "generic AIOHTTP request"
+
+                    with hub.start_span(span):
                         try:
                             response = await old_handle(self, request)
-                        except HTTPException:
+                        except HTTPException as e:
+                            span.set_http_status(e.status_code)
+                            raise
+                        except asyncio.CancelledError:
+                            span.set_status("cancelled")
                             raise
                         except Exception:
+                            # This will probably map to a 500 but seems like we
+                            # have no way to tell. Do not set span status.
                             reraise(*_capture_exception(hub))
 
+                        span.set_http_status(response.status)
                         return response
 
             # Explicitly wrap in task such that current contextvar context is
@@ -136,11 +147,7 @@ def _make_request_processor(weak_request):
             request_info["env"] = {"REMOTE_ADDR": request.remote}
 
             hub = Hub.current
-            request_info["headers"] = partial_serialize(
-                hub.client,
-                _filter_headers(dict(request.headers)),
-                should_repr_strings=False,
-            )
+            request_info["headers"] = _filter_headers(dict(request.headers))
 
             # Just attach raw data here if it is within bounds, if available.
             # Unfortunately there's no way to get structured data from aiohttp

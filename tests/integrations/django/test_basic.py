@@ -357,7 +357,7 @@ def test_transaction_style(
     assert event["transaction"] == expected_transaction
 
 
-def test_request_body(sentry_init, client, capture_events, fast_serialize):
+def test_request_body(sentry_init, client, capture_events):
     sentry_init(integrations=[DjangoIntegration()])
     events = capture_events()
     content, status, headers = client.post(
@@ -370,11 +370,10 @@ def test_request_body(sentry_init, client, capture_events, fast_serialize):
 
     assert event["message"] == "hi"
     assert event["request"]["data"] == ""
-    if not fast_serialize:
-        assert event["_meta"]["request"]["data"][""] == {
-            "len": 6,
-            "rem": [["!raw", "x", 0, 6]],
-        }
+    assert event["_meta"]["request"]["data"][""] == {
+        "len": 6,
+        "rem": [["!raw", "x", 0, 6]],
+    }
 
     del events[:]
 
@@ -519,6 +518,7 @@ def test_middleware_spans(sentry_init, client, capture_events):
 
     if DJANGO_VERSION >= (1, 10):
         reference_value = [
+            "tests.integrations.django.myapp.settings.TestFunctionMiddleware.__call__",
             "tests.integrations.django.myapp.settings.TestMiddleware.__call__",
             "django.contrib.auth.middleware.AuthenticationMiddleware.__call__",
             "django.contrib.sessions.middleware.SessionMiddleware.__call__",
